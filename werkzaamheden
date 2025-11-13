@@ -1,0 +1,2571 @@
+# SOCIAL API SPECIFICATIONS V1.0
+**Complete specifications for AI code generation**
+
+## DOCUMENT PURPOSE
+This document provides complete specifications for building the Social API microservice. It is designed for AI code agents to generate production-ready FastAPI code with zero ambiguity.
+
+## ARCHITECTURE CONTEXT
+
+### Service Overview
+- **Name**: Social API
+- **Framework**: FastAPI (Python 3.11+)
+- **Database**: PostgreSQL 15+ (schema: `activity`)
+- **Authentication**: JWT tokens from Auth API (Bearer token required)
+- **Rate Limiting**: Redis-based (slowapi library)
+- **Error Handling**: Consistent JSON error responses
+
+### Dependencies
+- **Auth API**: Provides JWT tokens with user_id, email, org_id, subscription_level, ghost_mode
+- **Database**: PostgreSQL with `activity` schema (see schema document)
+- **Redis**: For rate limiting and caching
+- **Email API**: For notification emails (optional integration)
+
+### JWT Token Structure
+All protected endpoints require `Authorization: Bearer <token>` header.
+
+**Access Token Claims:**
+```json
+{
+  "sub": "550e8400-e29b-41d4-a716-446655440000",
+  "email": "user@example.com",
+  "subscription_level": "premium",
+  "ghost_mode": false,
+  "exp": 1704067200,
+  "iat": 1704066300,
+  "type": "access"
+}
+```
+
+**CRITICAL**: All endpoints extract `user_id` from `token["sub"]` claim.
+
+---
+
+## API SCOPE: SOCIAL API
+
+The Social API handles:
+1. **Friendships**: Send, accept, decline, remove friend requests
+2. **Blocking System**: Asymmetric blocking with XXL activity exceptions
+3. **Favorites**: User favoriting system (ego feature)
+4. **Profile Views**: Track profile visits with Ghost Mode support
+5. **User Search**: Find users by name/username
+
+---
+
+## DATABASE STORED PROCEDURES
+
+### NAMING CONVENTION
+All stored procedures follow pattern: `sp_social_<action>_<entity>()`
+
+### RETURN TYPE CONVENTION
+- **Success**: Returns JSON object or array
+- **Error**: RAISE EXCEPTION with specific error message
+- **Empty Result**: Returns empty JSON array `[]` or `{"count": 0}`
+
+---
+
+## 1. FRIENDSHIPS MODULE
+
+### Overview
+- Friend requests must be explicitly sent and accepted
+- Friendship affects activity access (friends_only privacy level)
+- Bidirectional relationship (both users are friends)
+- Status: 'pending', 'accepted', 'blocked'
+
+### Database Table
+**activity.friendships**
+- PK: (user_id_1, user_id_2) where user_id_1 < user_id_2
+- status: VARCHAR(20) DEFAULT 'pending'
+- initiated_by: UUID (who sent request)
+- created_at: TIMESTAMP
+- accepted_at: TIMESTAMP (NULL until accepted)
+
+---
+
+### SP 1.1: sp_social_send_friend_request
+
+**Purpose**: Send friend request from user_id_1 to user_id_2
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_send_friend_request(
+    p_requester_user_id UUID,
+    p_target_user_id UUID
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Validate p_requester_user_id != p_target_user_id (cannot friend yourself)
+2. Check target user exists in activity.users
+3. Check no existing friendship (any status) between users
+4. Check p_requester_user_id is not blocked by p_target_user_id (activity.user_blocks)
+5. Check p_target_user_id is not blocked by p_requester_user_id
+6. Order user IDs (smaller UUID as user_id_1, larger as user_id_2)
+7. Insert into activity.friendships:
+   - user_id_1: smaller UUID
+   - user_id_2: larger UUID
+   - status: 'pending'
+   - initiated_by: p_requester_user_id
+   - created_at: NOW()
+
+**Return JSON:**
+```json
+{
+  "friendship_id": "user_id_1:user_id_2",
+  "requester_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "target_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "status": "pending",
+  "initiated_by": "550e8400-e29b-41d4-a716-446655440000",
+  "created_at": "2025-01-15T10:30:00Z"
+}
+```
+
+**Error Cases:**
+- `SELF_FRIEND_ERROR`: "Cannot send friend request to yourself"
+- `USER_NOT_FOUND`: "Target user does not exist"
+- `FRIENDSHIP_EXISTS`: "Friendship already exists with status: {status}"
+- `BLOCKED_BY_USER`: "You cannot send friend request to this user"
+- `USER_BLOCKED`: "Cannot send friend request to blocked user"
+
+---
+
+### SP 1.2: sp_social_accept_friend_request
+
+**Purpose**: Accept pending friend request
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_accept_friend_request(
+    p_accepting_user_id UUID,
+    p_requester_user_id UUID
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Order user IDs correctly (smaller as user_id_1)
+2. Find friendship where status='pending' AND initiated_by = p_requester_user_id
+3. Validate friendship exists
+4. Validate p_accepting_user_id is NOT the requester (can't accept own request)
+5. Update friendship:
+   - status: 'accepted'
+   - accepted_at: NOW()
+
+**Return JSON:**
+```json
+{
+  "friendship_id": "user_id_1:user_id_2",
+  "user_id_1": "550e8400-e29b-41d4-a716-446655440000",
+  "user_id_2": "660e8400-e29b-41d4-a716-446655440000",
+  "status": "accepted",
+  "initiated_by": "550e8400-e29b-41d4-a716-446655440000",
+  "accepted_at": "2025-01-15T10:35:00Z",
+  "created_at": "2025-01-15T10:30:00Z"
+}
+```
+
+**Error Cases:**
+- `FRIENDSHIP_NOT_FOUND`: "No pending friend request found"
+- `INVALID_ACCEPTOR`: "You cannot accept your own friend request"
+- `ALREADY_ACCEPTED`: "Friend request already accepted"
+
+---
+
+### SP 1.3: sp_social_decline_friend_request
+
+**Purpose**: Decline pending friend request (deletes the friendship record)
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_decline_friend_request(
+    p_declining_user_id UUID,
+    p_requester_user_id UUID
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Order user IDs correctly
+2. Find friendship where status='pending' AND initiated_by = p_requester_user_id
+3. Validate p_declining_user_id is NOT the requester
+4. DELETE from activity.friendships
+
+**Return JSON:**
+```json
+{
+  "message": "Friend request declined",
+  "requester_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "declined_at": "2025-01-15T10:32:00Z"
+}
+```
+
+**Error Cases:**
+- `FRIENDSHIP_NOT_FOUND`: "No pending friend request found"
+- `INVALID_DECLINER`: "You cannot decline your own friend request"
+
+---
+
+### SP 1.4: sp_social_remove_friend
+
+**Purpose**: Remove existing friendship (both pending and accepted)
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_remove_friend(
+    p_user_id UUID,
+    p_friend_user_id UUID
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Order user IDs correctly
+2. Find friendship (any status)
+3. DELETE from activity.friendships
+
+**Return JSON:**
+```json
+{
+  "message": "Friendship removed",
+  "removed_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "removed_at": "2025-01-15T11:00:00Z"
+}
+```
+
+**Error Cases:**
+- `FRIENDSHIP_NOT_FOUND`: "No friendship found with this user"
+
+---
+
+### SP 1.5: sp_social_get_friends_list
+
+**Purpose**: Get all accepted friends for a user
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_get_friends_list(
+    p_user_id UUID,
+    p_limit INT DEFAULT 100,
+    p_offset INT DEFAULT 0
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Query activity.friendships WHERE status='accepted' AND (user_id_1 = p_user_id OR user_id_2 = p_user_id)
+2. JOIN with activity.users to get friend details
+3. For each friendship, return the OTHER user's profile
+4. Order by accepted_at DESC
+5. Apply pagination (LIMIT, OFFSET)
+
+**Return JSON:**
+```json
+{
+  "friends": [
+    {
+      "user_id": "660e8400-e29b-41d4-a716-446655440000",
+      "username": "johndoe",
+      "first_name": "John",
+      "last_name": "Doe",
+      "main_photo_url": "https://cdn.example.com/photos/johndoe.jpg",
+      "is_verified": true,
+      "friendship_since": "2025-01-15T10:35:00Z"
+    }
+  ],
+  "total_count": 1,
+  "limit": 100,
+  "offset": 0
+}
+```
+
+**Error Cases:**
+- None (returns empty array if no friends)
+
+---
+
+### SP 1.6: sp_social_get_pending_friend_requests
+
+**Purpose**: Get all pending friend requests (sent TO this user)
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_get_pending_friend_requests(
+    p_user_id UUID,
+    p_limit INT DEFAULT 50,
+    p_offset INT DEFAULT 0
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Query activity.friendships WHERE status='pending' AND initiated_by != p_user_id AND (user_id_1 = p_user_id OR user_id_2 = p_user_id)
+2. JOIN with activity.users to get requester details
+3. Order by created_at DESC
+4. Apply pagination
+
+**Return JSON:**
+```json
+{
+  "requests": [
+    {
+      "requester_user_id": "550e8400-e29b-41d4-a716-446655440000",
+      "username": "janedoe",
+      "first_name": "Jane",
+      "last_name": "Doe",
+      "main_photo_url": "https://cdn.example.com/photos/janedoe.jpg",
+      "is_verified": false,
+      "requested_at": "2025-01-15T10:30:00Z"
+    }
+  ],
+  "total_count": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+**Error Cases:**
+- None (returns empty array if no requests)
+
+---
+
+### SP 1.7: sp_social_get_sent_friend_requests
+
+**Purpose**: Get all pending friend requests sent BY this user
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_get_sent_friend_requests(
+    p_user_id UUID,
+    p_limit INT DEFAULT 50,
+    p_offset INT DEFAULT 0
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Query activity.friendships WHERE status='pending' AND initiated_by = p_user_id
+2. JOIN with activity.users to get target user details
+3. Order by created_at DESC
+4. Apply pagination
+
+**Return JSON:**
+```json
+{
+  "requests": [
+    {
+      "target_user_id": "660e8400-e29b-41d4-a716-446655440000",
+      "username": "bobsmith",
+      "first_name": "Bob",
+      "last_name": "Smith",
+      "main_photo_url": "https://cdn.example.com/photos/bobsmith.jpg",
+      "is_verified": true,
+      "requested_at": "2025-01-15T10:30:00Z"
+    }
+  ],
+  "total_count": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+**Error Cases:**
+- None (returns empty array if no sent requests)
+
+---
+
+### SP 1.8: sp_social_check_friendship_status
+
+**Purpose**: Check friendship status between two users
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_check_friendship_status(
+    p_user_id_1 UUID,
+    p_user_id_2 UUID
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Order user IDs correctly
+2. Query activity.friendships
+3. Return status or 'none' if no friendship exists
+
+**Return JSON:**
+```json
+{
+  "status": "accepted",
+  "initiated_by": "550e8400-e29b-41d4-a716-446655440000",
+  "created_at": "2025-01-15T10:30:00Z",
+  "accepted_at": "2025-01-15T10:35:00Z"
+}
+```
+
+OR if no friendship:
+```json
+{
+  "status": "none"
+}
+```
+
+**Error Cases:**
+- None (returns status='none' if no friendship)
+
+---
+
+## FRIENDSHIPS API ENDPOINTS
+
+### Endpoint 1.1: Send Friend Request
+```
+POST /social/friends/request
+```
+
+**Authentication**: Required (Bearer token)
+
+**Rate Limit**: 20 requests per minute per user
+
+**Request Body:**
+```json
+{
+  "target_user_id": "660e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Request Validation:**
+- target_user_id: Required, valid UUID format
+
+**Processing:**
+1. Extract user_id from JWT token (token["sub"])
+2. Call sp_social_send_friend_request(user_id, target_user_id)
+3. Return response
+
+**Success Response (201 Created):**
+```json
+{
+  "friendship_id": "user_id_1:user_id_2",
+  "requester_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "target_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "status": "pending",
+  "initiated_by": "550e8400-e29b-41d4-a716-446655440000",
+  "created_at": "2025-01-15T10:30:00Z"
+}
+```
+
+**Error Responses:**
+- 400 Bad Request: Validation errors or business logic errors from SP
+- 401 Unauthorized: Invalid/missing token
+- 429 Too Many Requests: Rate limit exceeded
+
+---
+
+### Endpoint 1.2: Accept Friend Request
+```
+POST /social/friends/accept
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 30 requests per minute per user
+
+**Request Body:**
+```json
+{
+  "requester_user_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Request Validation:**
+- requester_user_id: Required, valid UUID
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_accept_friend_request(user_id, requester_user_id)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "friendship_id": "user_id_1:user_id_2",
+  "user_id_1": "550e8400-e29b-41d4-a716-446655440000",
+  "user_id_2": "660e8400-e29b-41d4-a716-446655440000",
+  "status": "accepted",
+  "initiated_by": "550e8400-e29b-41d4-a716-446655440000",
+  "accepted_at": "2025-01-15T10:35:00Z",
+  "created_at": "2025-01-15T10:30:00Z"
+}
+```
+
+**Error Responses:**
+- 400 Bad Request: SP errors
+- 401 Unauthorized: Invalid token
+- 404 Not Found: Friendship not found
+
+---
+
+### Endpoint 1.3: Decline Friend Request
+```
+POST /social/friends/decline
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 30 requests per minute per user
+
+**Request Body:**
+```json
+{
+  "requester_user_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Request Validation:**
+- requester_user_id: Required, valid UUID
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_decline_friend_request(user_id, requester_user_id)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "message": "Friend request declined",
+  "requester_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "declined_at": "2025-01-15T10:32:00Z"
+}
+```
+
+**Error Responses:**
+- 400 Bad Request: SP errors
+- 401 Unauthorized: Invalid token
+- 404 Not Found: Request not found
+
+---
+
+### Endpoint 1.4: Remove Friend
+```
+DELETE /social/friends/{friend_user_id}
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 20 requests per minute per user
+
+**Path Parameters:**
+- friend_user_id: UUID of friend to remove
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_remove_friend(user_id, friend_user_id)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "message": "Friendship removed",
+  "removed_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "removed_at": "2025-01-15T11:00:00Z"
+}
+```
+
+**Error Responses:**
+- 400 Bad Request: Invalid UUID
+- 401 Unauthorized: Invalid token
+- 404 Not Found: Friendship not found
+
+---
+
+### Endpoint 1.5: Get Friends List
+```
+GET /social/friends
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 60 requests per minute per user
+
+**Query Parameters:**
+- limit: Integer (default: 100, max: 100)
+- offset: Integer (default: 0)
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_get_friends_list(user_id, limit, offset)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "friends": [
+    {
+      "user_id": "660e8400-e29b-41d4-a716-446655440000",
+      "username": "johndoe",
+      "first_name": "John",
+      "last_name": "Doe",
+      "main_photo_url": "https://cdn.example.com/photos/johndoe.jpg",
+      "is_verified": true,
+      "friendship_since": "2025-01-15T10:35:00Z"
+    }
+  ],
+  "total_count": 1,
+  "limit": 100,
+  "offset": 0
+}
+```
+
+**Error Responses:**
+- 401 Unauthorized: Invalid token
+
+---
+
+### Endpoint 1.6: Get Pending Friend Requests (Received)
+```
+GET /social/friends/requests/received
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 60 requests per minute per user
+
+**Query Parameters:**
+- limit: Integer (default: 50, max: 100)
+- offset: Integer (default: 0)
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_get_pending_friend_requests(user_id, limit, offset)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "requests": [
+    {
+      "requester_user_id": "550e8400-e29b-41d4-a716-446655440000",
+      "username": "janedoe",
+      "first_name": "Jane",
+      "last_name": "Doe",
+      "main_photo_url": "https://cdn.example.com/photos/janedoe.jpg",
+      "is_verified": false,
+      "requested_at": "2025-01-15T10:30:00Z"
+    }
+  ],
+  "total_count": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+**Error Responses:**
+- 401 Unauthorized: Invalid token
+
+---
+
+### Endpoint 1.7: Get Sent Friend Requests
+```
+GET /social/friends/requests/sent
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 60 requests per minute per user
+
+**Query Parameters:**
+- limit: Integer (default: 50, max: 100)
+- offset: Integer (default: 0)
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_get_sent_friend_requests(user_id, limit, offset)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "requests": [
+    {
+      "target_user_id": "660e8400-e29b-41d4-a716-446655440000",
+      "username": "bobsmith",
+      "first_name": "Bob",
+      "last_name": "Smith",
+      "main_photo_url": "https://cdn.example.com/photos/bobsmith.jpg",
+      "is_verified": true,
+      "requested_at": "2025-01-15T10:30:00Z"
+    }
+  ],
+  "total_count": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+**Error Responses:**
+- 401 Unauthorized: Invalid token
+
+---
+
+### Endpoint 1.8: Check Friendship Status
+```
+GET /social/friends/status/{target_user_id}
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 100 requests per minute per user
+
+**Path Parameters:**
+- target_user_id: UUID of user to check status with
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_check_friendship_status(user_id, target_user_id)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "status": "accepted",
+  "initiated_by": "550e8400-e29b-41d4-a716-446655440000",
+  "created_at": "2025-01-15T10:30:00Z",
+  "accepted_at": "2025-01-15T10:35:00Z"
+}
+```
+
+OR if no friendship:
+```json
+{
+  "status": "none"
+}
+```
+
+**Error Responses:**
+- 400 Bad Request: Invalid UUID
+- 401 Unauthorized: Invalid token
+
+---
+
+## 2. BLOCKING SYSTEM MODULE
+
+### Overview
+- **ASYMMETRIC**: User A can block User B independently (B doesn't block A)
+- **XXL EXCEPTION**: Blocking does NOT apply to XXL activities (activity_type='xxl')
+- **Effects**: Blocked user cannot see blocker's profile, activities, posts, or send messages
+- **Mutual Blocking**: Both users can independently block each other
+
+### Database Table
+**activity.user_blocks**
+- PK: (blocker_user_id, blocked_user_id)
+- blocker_user_id: UUID (who blocked)
+- blocked_user_id: UUID (who was blocked)
+- created_at: TIMESTAMP
+- reason: TEXT (optional)
+
+---
+
+### SP 2.1: sp_social_block_user
+
+**Purpose**: Block a user
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_block_user(
+    p_blocker_user_id UUID,
+    p_blocked_user_id UUID,
+    p_reason TEXT DEFAULT NULL
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Validate p_blocker_user_id != p_blocked_user_id (cannot block yourself)
+2. Check blocked user exists in activity.users
+3. Check not already blocked (no existing record in activity.user_blocks)
+4. Insert into activity.user_blocks:
+   - blocker_user_id: p_blocker_user_id
+   - blocked_user_id: p_blocked_user_id
+   - created_at: NOW()
+   - reason: p_reason (optional)
+5. DELETE any existing friendship between users (from activity.friendships)
+6. IMPORTANT: This is ONE-WAY block (asymmetric)
+
+**Return JSON:**
+```json
+{
+  "blocker_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "blocked_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "blocked_at": "2025-01-15T12:00:00Z",
+  "friendship_removed": true
+}
+```
+
+**Error Cases:**
+- `SELF_BLOCK_ERROR`: "Cannot block yourself"
+- `USER_NOT_FOUND`: "User does not exist"
+- `ALREADY_BLOCKED`: "User is already blocked"
+
+---
+
+### SP 2.2: sp_social_unblock_user
+
+**Purpose**: Unblock a previously blocked user
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_unblock_user(
+    p_blocker_user_id UUID,
+    p_blocked_user_id UUID
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Find block record in activity.user_blocks
+2. Validate block exists
+3. DELETE from activity.user_blocks
+
+**Return JSON:**
+```json
+{
+  "blocker_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "unblocked_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "unblocked_at": "2025-01-15T12:30:00Z"
+}
+```
+
+**Error Cases:**
+- `BLOCK_NOT_FOUND`: "No block found for this user"
+
+---
+
+### SP 2.3: sp_social_get_blocked_users
+
+**Purpose**: Get list of all users blocked by current user
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_get_blocked_users(
+    p_blocker_user_id UUID,
+    p_limit INT DEFAULT 100,
+    p_offset INT DEFAULT 0
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Query activity.user_blocks WHERE blocker_user_id = p_blocker_user_id
+2. JOIN with activity.users to get blocked user details
+3. Order by created_at DESC
+4. Apply pagination
+
+**Return JSON:**
+```json
+{
+  "blocked_users": [
+    {
+      "blocked_user_id": "660e8400-e29b-41d4-a716-446655440000",
+      "username": "troublemaker",
+      "first_name": "John",
+      "last_name": "Doe",
+      "main_photo_url": "https://cdn.example.com/photos/troublemaker.jpg",
+      "blocked_at": "2025-01-15T12:00:00Z",
+      "reason": "Spam messages"
+    }
+  ],
+  "total_count": 1,
+  "limit": 100,
+  "offset": 0
+}
+```
+
+**Error Cases:**
+- None (returns empty array if no blocked users)
+
+---
+
+### SP 2.4: sp_social_check_block_status
+
+**Purpose**: Check if user A has blocked user B OR if user B has blocked user A
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_check_block_status(
+    p_user_id_1 UUID,
+    p_user_id_2 UUID
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Check if p_user_id_1 has blocked p_user_id_2
+2. Check if p_user_id_2 has blocked p_user_id_1
+3. Return block status for both directions
+
+**Return JSON:**
+```json
+{
+  "user_1_blocked_user_2": true,
+  "user_2_blocked_user_1": false,
+  "any_block_exists": true
+}
+```
+
+**Error Cases:**
+- None (returns false for all if no blocks)
+
+---
+
+### SP 2.5: sp_social_check_can_interact
+
+**Purpose**: Check if two users can interact (considering blocks and activity type)
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_check_can_interact(
+    p_user_id_1 UUID,
+    p_user_id_2 UUID,
+    p_activity_type TEXT DEFAULT 'standard'
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. If p_activity_type = 'xxl': ALWAYS return can_interact=true (XXL exception)
+2. Check if either user has blocked the other
+3. If any block exists AND activity_type != 'xxl': return can_interact=false
+4. Otherwise: return can_interact=true
+
+**Return JSON:**
+```json
+{
+  "can_interact": false,
+  "reason": "blocked",
+  "activity_type": "standard"
+}
+```
+
+OR for XXL:
+```json
+{
+  "can_interact": true,
+  "reason": "xxl_exception",
+  "activity_type": "xxl"
+}
+```
+
+**Error Cases:**
+- None
+
+---
+
+## BLOCKING SYSTEM API ENDPOINTS
+
+### Endpoint 2.1: Block User
+```
+POST /social/blocks
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 10 requests per minute per user
+
+**Request Body:**
+```json
+{
+  "blocked_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "reason": "Spam messages"
+}
+```
+
+**Request Validation:**
+- blocked_user_id: Required, valid UUID
+- reason: Optional, max 500 characters
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_block_user(user_id, blocked_user_id, reason)
+3. Return response
+
+**Success Response (201 Created):**
+```json
+{
+  "blocker_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "blocked_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "blocked_at": "2025-01-15T12:00:00Z",
+  "friendship_removed": true
+}
+```
+
+**Error Responses:**
+- 400 Bad Request: SP errors
+- 401 Unauthorized: Invalid token
+- 429 Too Many Requests: Rate limit
+
+---
+
+### Endpoint 2.2: Unblock User
+```
+DELETE /social/blocks/{blocked_user_id}
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 20 requests per minute per user
+
+**Path Parameters:**
+- blocked_user_id: UUID of user to unblock
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_unblock_user(user_id, blocked_user_id)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "blocker_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "unblocked_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "unblocked_at": "2025-01-15T12:30:00Z"
+}
+```
+
+**Error Responses:**
+- 400 Bad Request: Invalid UUID
+- 401 Unauthorized: Invalid token
+- 404 Not Found: Block not found
+
+---
+
+### Endpoint 2.3: Get Blocked Users List
+```
+GET /social/blocks
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 30 requests per minute per user
+
+**Query Parameters:**
+- limit: Integer (default: 100, max: 100)
+- offset: Integer (default: 0)
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_get_blocked_users(user_id, limit, offset)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "blocked_users": [
+    {
+      "blocked_user_id": "660e8400-e29b-41d4-a716-446655440000",
+      "username": "troublemaker",
+      "first_name": "John",
+      "last_name": "Doe",
+      "main_photo_url": "https://cdn.example.com/photos/troublemaker.jpg",
+      "blocked_at": "2025-01-15T12:00:00Z",
+      "reason": "Spam messages"
+    }
+  ],
+  "total_count": 1,
+  "limit": 100,
+  "offset": 0
+}
+```
+
+**Error Responses:**
+- 401 Unauthorized: Invalid token
+
+---
+
+### Endpoint 2.4: Check Block Status
+```
+GET /social/blocks/status/{target_user_id}
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 100 requests per minute per user
+
+**Path Parameters:**
+- target_user_id: UUID of user to check block status with
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_check_block_status(user_id, target_user_id)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "user_1_blocked_user_2": true,
+  "user_2_blocked_user_1": false,
+  "any_block_exists": true
+}
+```
+
+**Error Responses:**
+- 400 Bad Request: Invalid UUID
+- 401 Unauthorized: Invalid token
+
+---
+
+### Endpoint 2.5: Check Can Interact (with Activity Type)
+```
+GET /social/blocks/can-interact/{target_user_id}
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 100 requests per minute per user
+
+**Path Parameters:**
+- target_user_id: UUID of user to check interaction with
+
+**Query Parameters:**
+- activity_type: String (default: 'standard', values: 'standard', 'xxl', 'womens_only', 'mens_only')
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_check_can_interact(user_id, target_user_id, activity_type)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "can_interact": false,
+  "reason": "blocked",
+  "activity_type": "standard"
+}
+```
+
+**Error Responses:**
+- 400 Bad Request: Invalid UUID or activity_type
+- 401 Unauthorized: Invalid token
+
+---
+
+## 3. FAVORITES MODULE
+
+### Overview
+- Users can "favorite" other users (like bookmarking)
+- **Premium Feature**: See who favorited you
+- Free users can favorite others but cannot see who favorited them
+- One-way relationship (A favorites B doesn't mean B favorites A)
+
+### Database Table
+**activity.user_favorites**
+- PK: (favoriting_user_id, favorited_user_id)
+- favoriting_user_id: UUID (who favorited)
+- favorited_user_id: UUID (who was favorited)
+- created_at: TIMESTAMP
+
+---
+
+### SP 3.1: sp_social_favorite_user
+
+**Purpose**: Favorite a user
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_favorite_user(
+    p_favoriting_user_id UUID,
+    p_favorited_user_id UUID
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Validate p_favoriting_user_id != p_favorited_user_id (cannot favorite yourself)
+2. Check favorited user exists
+3. Check not already favorited
+4. Check favoriting_user has not blocked favorited_user
+5. Check favorited_user has not blocked favoriting_user
+6. Insert into activity.user_favorites:
+   - favoriting_user_id: p_favoriting_user_id
+   - favorited_user_id: p_favorited_user_id
+   - created_at: NOW()
+
+**Return JSON:**
+```json
+{
+  "favoriting_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "favorited_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "favorited_at": "2025-01-15T13:00:00Z"
+}
+```
+
+**Error Cases:**
+- `SELF_FAVORITE_ERROR`: "Cannot favorite yourself"
+- `USER_NOT_FOUND`: "User does not exist"
+- `ALREADY_FAVORITED`: "User is already favorited"
+- `BLOCKED_USER`: "Cannot favorite blocked user"
+
+---
+
+### SP 3.2: sp_social_unfavorite_user
+
+**Purpose**: Remove favorite
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_unfavorite_user(
+    p_favoriting_user_id UUID,
+    p_favorited_user_id UUID
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Find favorite record
+2. DELETE from activity.user_favorites
+
+**Return JSON:**
+```json
+{
+  "favoriting_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "unfavorited_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "unfavorited_at": "2025-01-15T13:30:00Z"
+}
+```
+
+**Error Cases:**
+- `FAVORITE_NOT_FOUND`: "Favorite not found"
+
+---
+
+### SP 3.3: sp_social_get_my_favorites
+
+**Purpose**: Get list of users I have favorited
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_get_my_favorites(
+    p_user_id UUID,
+    p_limit INT DEFAULT 100,
+    p_offset INT DEFAULT 0
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Query activity.user_favorites WHERE favoriting_user_id = p_user_id
+2. JOIN with activity.users to get user details
+3. Order by created_at DESC
+4. Apply pagination
+
+**Return JSON:**
+```json
+{
+  "favorites": [
+    {
+      "user_id": "660e8400-e29b-41d4-a716-446655440000",
+      "username": "awesome_user",
+      "first_name": "Jane",
+      "last_name": "Doe",
+      "main_photo_url": "https://cdn.example.com/photos/awesome.jpg",
+      "is_verified": true,
+      "favorited_at": "2025-01-15T13:00:00Z"
+    }
+  ],
+  "total_count": 1,
+  "limit": 100,
+  "offset": 0
+}
+```
+
+**Error Cases:**
+- None (returns empty array)
+
+---
+
+### SP 3.4: sp_social_get_who_favorited_me
+
+**Purpose**: Get list of users who favorited me (Premium feature)
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_get_who_favorited_me(
+    p_user_id UUID,
+    p_subscription_level TEXT,
+    p_limit INT DEFAULT 100,
+    p_offset INT DEFAULT 0
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Check p_subscription_level IN ('premium', 'club')
+2. If not premium/club: RAISE EXCEPTION 'PREMIUM_REQUIRED'
+3. Query activity.user_favorites WHERE favorited_user_id = p_user_id
+4. JOIN with activity.users to get favoriting user details
+5. Order by created_at DESC
+6. Apply pagination
+
+**Return JSON:**
+```json
+{
+  "favorited_by": [
+    {
+      "user_id": "550e8400-e29b-41d4-a716-446655440000",
+      "username": "fan_user",
+      "first_name": "John",
+      "last_name": "Smith",
+      "main_photo_url": "https://cdn.example.com/photos/fan.jpg",
+      "is_verified": false,
+      "favorited_at": "2025-01-15T13:00:00Z"
+    }
+  ],
+  "total_count": 1,
+  "limit": 100,
+  "offset": 0
+}
+```
+
+**Error Cases:**
+- `PREMIUM_REQUIRED`: "This feature requires Premium or Club subscription"
+
+---
+
+### SP 3.5: sp_social_check_favorite_status
+
+**Purpose**: Check if user has favorited another user
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_check_favorite_status(
+    p_favoriting_user_id UUID,
+    p_favorited_user_id UUID
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Check if favorite exists in activity.user_favorites
+
+**Return JSON:**
+```json
+{
+  "is_favorited": true,
+  "favorited_at": "2025-01-15T13:00:00Z"
+}
+```
+
+OR if not favorited:
+```json
+{
+  "is_favorited": false
+}
+```
+
+**Error Cases:**
+- None
+
+---
+
+## FAVORITES API ENDPOINTS
+
+### Endpoint 3.1: Favorite User
+```
+POST /social/favorites
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 30 requests per minute per user
+
+**Request Body:**
+```json
+{
+  "favorited_user_id": "660e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Request Validation:**
+- favorited_user_id: Required, valid UUID
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_favorite_user(user_id, favorited_user_id)
+3. Return response
+
+**Success Response (201 Created):**
+```json
+{
+  "favoriting_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "favorited_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "favorited_at": "2025-01-15T13:00:00Z"
+}
+```
+
+**Error Responses:**
+- 400 Bad Request: SP errors
+- 401 Unauthorized: Invalid token
+
+---
+
+### Endpoint 3.2: Unfavorite User
+```
+DELETE /social/favorites/{favorited_user_id}
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 30 requests per minute per user
+
+**Path Parameters:**
+- favorited_user_id: UUID of user to unfavorite
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_unfavorite_user(user_id, favorited_user_id)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "favoriting_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "unfavorited_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "unfavorited_at": "2025-01-15T13:30:00Z"
+}
+```
+
+**Error Responses:**
+- 400 Bad Request: Invalid UUID
+- 401 Unauthorized: Invalid token
+- 404 Not Found: Favorite not found
+
+---
+
+### Endpoint 3.3: Get My Favorites
+```
+GET /social/favorites/mine
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 60 requests per minute per user
+
+**Query Parameters:**
+- limit: Integer (default: 100, max: 100)
+- offset: Integer (default: 0)
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_get_my_favorites(user_id, limit, offset)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "favorites": [
+    {
+      "user_id": "660e8400-e29b-41d4-a716-446655440000",
+      "username": "awesome_user",
+      "first_name": "Jane",
+      "last_name": "Doe",
+      "main_photo_url": "https://cdn.example.com/photos/awesome.jpg",
+      "is_verified": true,
+      "favorited_at": "2025-01-15T13:00:00Z"
+    }
+  ],
+  "total_count": 1,
+  "limit": 100,
+  "offset": 0
+}
+```
+
+**Error Responses:**
+- 401 Unauthorized: Invalid token
+
+---
+
+### Endpoint 3.4: Get Who Favorited Me (Premium)
+```
+GET /social/favorites/who-favorited-me
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 60 requests per minute per user
+
+**Query Parameters:**
+- limit: Integer (default: 100, max: 100)
+- offset: Integer (default: 0)
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id and subscription_level from JWT token
+2. Call sp_social_get_who_favorited_me(user_id, subscription_level, limit, offset)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "favorited_by": [
+    {
+      "user_id": "550e8400-e29b-41d4-a716-446655440000",
+      "username": "fan_user",
+      "first_name": "John",
+      "last_name": "Smith",
+      "main_photo_url": "https://cdn.example.com/photos/fan.jpg",
+      "is_verified": false,
+      "favorited_at": "2025-01-15T13:00:00Z"
+    }
+  ],
+  "total_count": 1,
+  "limit": 100,
+  "offset": 0
+}
+```
+
+**Error Responses:**
+- 401 Unauthorized: Invalid token
+- 403 Forbidden: Premium subscription required
+
+---
+
+### Endpoint 3.5: Check Favorite Status
+```
+GET /social/favorites/status/{target_user_id}
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 100 requests per minute per user
+
+**Path Parameters:**
+- target_user_id: UUID of user to check favorite status
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_check_favorite_status(user_id, target_user_id)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "is_favorited": true,
+  "favorited_at": "2025-01-15T13:00:00Z"
+}
+```
+
+**Error Responses:**
+- 400 Bad Request: Invalid UUID
+- 401 Unauthorized: Invalid token
+
+---
+
+## 4. PROFILE VIEWS MODULE
+
+### Overview
+- Track when users view other users' profiles
+- **Premium Feature**: See who viewed your profile
+- **Ghost Mode (Premium)**: Visit profiles invisibly - NO record created
+- Free users: Profile views are tracked but cannot see who viewed them
+- View count is visible to profile owner
+
+### Database Table
+**activity.profile_views**
+- view_id: UUID (PK)
+- viewer_user_id: UUID (who viewed)
+- viewed_user_id: UUID (whose profile was viewed)
+- viewed_at: TIMESTAMP
+
+### Ghost Mode
+**activity.user_settings.ghost_mode** (BOOLEAN)
+- If viewer has ghost_mode=TRUE: NO record is created in profile_views
+- Premium feature only
+
+---
+
+### SP 4.1: sp_social_record_profile_view
+
+**Purpose**: Record a profile view (respects Ghost Mode)
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_record_profile_view(
+    p_viewer_user_id UUID,
+    p_viewed_user_id UUID,
+    p_ghost_mode BOOLEAN
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Validate p_viewer_user_id != p_viewed_user_id (cannot view own profile in this context)
+2. Check viewed user exists
+3. Check viewer has not blocked viewed user
+4. Check viewed user has not blocked viewer
+5. If p_ghost_mode = TRUE: Return success WITHOUT creating record (Ghost Mode)
+6. If p_ghost_mode = FALSE: Insert into activity.profile_views:
+   - view_id: uuidv7()
+   - viewer_user_id: p_viewer_user_id
+   - viewed_user_id: p_viewed_user_id
+   - viewed_at: NOW()
+
+**Return JSON (Ghost Mode):**
+```json
+{
+  "view_recorded": false,
+  "ghost_mode": true,
+  "viewed_user_id": "660e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Return JSON (Normal Mode):**
+```json
+{
+  "view_recorded": true,
+  "view_id": "770e8400-e29b-41d4-a716-446655440000",
+  "viewer_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "viewed_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "viewed_at": "2025-01-15T14:00:00Z"
+}
+```
+
+**Error Cases:**
+- `SELF_VIEW_ERROR`: "Cannot record self-profile view"
+- `USER_NOT_FOUND`: "User does not exist"
+- `BLOCKED_USER`: "Cannot view blocked user profile"
+
+---
+
+### SP 4.2: sp_social_get_who_viewed_my_profile
+
+**Purpose**: Get list of users who viewed my profile (Premium feature)
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_get_who_viewed_my_profile(
+    p_user_id UUID,
+    p_subscription_level TEXT,
+    p_limit INT DEFAULT 100,
+    p_offset INT DEFAULT 0
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Check p_subscription_level IN ('premium', 'club')
+2. If not premium/club: RAISE EXCEPTION 'PREMIUM_REQUIRED'
+3. Query activity.profile_views WHERE viewed_user_id = p_user_id
+4. JOIN with activity.users to get viewer details
+5. Order by viewed_at DESC
+6. Apply pagination
+7. Return unique viewers (if same user viewed multiple times, show most recent)
+
+**Return JSON:**
+```json
+{
+  "viewers": [
+    {
+      "viewer_user_id": "550e8400-e29b-41d4-a716-446655440000",
+      "username": "curious_user",
+      "first_name": "John",
+      "last_name": "Smith",
+      "main_photo_url": "https://cdn.example.com/photos/curious.jpg",
+      "is_verified": false,
+      "last_viewed_at": "2025-01-15T14:00:00Z",
+      "view_count": 3
+    }
+  ],
+  "total_viewers": 1,
+  "total_views": 3,
+  "limit": 100,
+  "offset": 0
+}
+```
+
+**Error Cases:**
+- `PREMIUM_REQUIRED`: "This feature requires Premium or Club subscription"
+
+---
+
+### SP 4.3: sp_social_get_profile_view_count
+
+**Purpose**: Get total view count for user's profile
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_get_profile_view_count(
+    p_user_id UUID
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Count total views in activity.profile_views WHERE viewed_user_id = p_user_id
+2. Count unique viewers (DISTINCT viewer_user_id)
+
+**Return JSON:**
+```json
+{
+  "user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "total_views": 150,
+  "unique_viewers": 45
+}
+```
+
+**Error Cases:**
+- None (returns 0 if no views)
+
+---
+
+## PROFILE VIEWS API ENDPOINTS
+
+### Endpoint 4.1: Record Profile View
+```
+POST /social/profile-views
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 100 requests per minute per user
+
+**Request Body:**
+```json
+{
+  "viewed_user_id": "660e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Request Validation:**
+- viewed_user_id: Required, valid UUID
+
+**Processing:**
+1. Extract user_id and ghost_mode from JWT token
+2. Call sp_social_record_profile_view(user_id, viewed_user_id, ghost_mode)
+3. Return response
+
+**Success Response (200 OK - Normal Mode):**
+```json
+{
+  "view_recorded": true,
+  "view_id": "770e8400-e29b-41d4-a716-446655440000",
+  "viewer_user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "viewed_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "viewed_at": "2025-01-15T14:00:00Z"
+}
+```
+
+**Success Response (200 OK - Ghost Mode):**
+```json
+{
+  "view_recorded": false,
+  "ghost_mode": true,
+  "viewed_user_id": "660e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Error Responses:**
+- 400 Bad Request: SP errors
+- 401 Unauthorized: Invalid token
+
+---
+
+### Endpoint 4.2: Get Who Viewed My Profile (Premium)
+```
+GET /social/profile-views/who-viewed-me
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 60 requests per minute per user
+
+**Query Parameters:**
+- limit: Integer (default: 100, max: 100)
+- offset: Integer (default: 0)
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id and subscription_level from JWT token
+2. Call sp_social_get_who_viewed_my_profile(user_id, subscription_level, limit, offset)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "viewers": [
+    {
+      "viewer_user_id": "550e8400-e29b-41d4-a716-446655440000",
+      "username": "curious_user",
+      "first_name": "John",
+      "last_name": "Smith",
+      "main_photo_url": "https://cdn.example.com/photos/curious.jpg",
+      "is_verified": false,
+      "last_viewed_at": "2025-01-15T14:00:00Z",
+      "view_count": 3
+    }
+  ],
+  "total_viewers": 1,
+  "total_views": 3,
+  "limit": 100,
+  "offset": 0
+}
+```
+
+**Error Responses:**
+- 401 Unauthorized: Invalid token
+- 403 Forbidden: Premium subscription required
+
+---
+
+### Endpoint 4.3: Get Profile View Count
+```
+GET /social/profile-views/my-count
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 60 requests per minute per user
+
+**Query Parameters:** None
+
+**Request Body:** None
+
+**Processing:**
+1. Extract user_id from JWT token
+2. Call sp_social_get_profile_view_count(user_id)
+3. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "total_views": 150,
+  "unique_viewers": 45
+}
+```
+
+**Error Responses:**
+- 401 Unauthorized: Invalid token
+
+---
+
+## 5. USER SEARCH MODULE
+
+### Overview
+- Search users by name or username
+- Respects blocking (cannot find blocked users)
+- Returns basic profile information
+
+### Database Tables
+- activity.users (main search target)
+- activity.user_blocks (filter out blocked users)
+
+---
+
+### SP 5.1: sp_social_search_users
+
+**Purpose**: Search users by name or username
+
+**Parameters:**
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_social_search_users(
+    p_searcher_user_id UUID,
+    p_search_query TEXT,
+    p_limit INT DEFAULT 20,
+    p_offset INT DEFAULT 0
+)
+RETURNS JSON
+```
+
+**Business Logic:**
+1. Validate p_search_query is not empty (min 2 characters)
+2. Query activity.users WHERE:
+   - username ILIKE '%{query}%' OR
+   - first_name ILIKE '%{query}%' OR
+   - last_name ILIKE '%{query}%' OR
+   - CONCAT(first_name, ' ', last_name) ILIKE '%{query}%'
+3. Exclude users where:
+   - p_searcher_user_id has blocked them (activity.user_blocks)
+   - They have blocked p_searcher_user_id
+   - user_id = p_searcher_user_id (exclude self)
+4. Only include active users (status = 'active')
+5. Order by:
+   - is_verified DESC (verified users first)
+   - Relevance score (exact matches first)
+   - username ASC
+6. Apply pagination
+
+**Return JSON:**
+```json
+{
+  "users": [
+    {
+      "user_id": "660e8400-e29b-41d4-a716-446655440000",
+      "username": "johndoe",
+      "first_name": "John",
+      "last_name": "Doe",
+      "main_photo_url": "https://cdn.example.com/photos/johndoe.jpg",
+      "is_verified": true,
+      "activities_created_count": 15,
+      "activities_attended_count": 45
+    }
+  ],
+  "total_count": 1,
+  "search_query": "john",
+  "limit": 20,
+  "offset": 0
+}
+```
+
+**Error Cases:**
+- `INVALID_QUERY`: "Search query must be at least 2 characters"
+
+---
+
+## USER SEARCH API ENDPOINTS
+
+### Endpoint 5.1: Search Users
+```
+GET /social/users/search
+```
+
+**Authentication**: Required
+
+**Rate Limit**: 60 requests per minute per user
+
+**Query Parameters:**
+- q: String (required, min 2 characters, max 100 characters)
+- limit: Integer (default: 20, max: 50)
+- offset: Integer (default: 0)
+
+**Request Body:** None
+
+**Request Validation:**
+- q: Required, min length 2, max length 100
+
+**Processing:**
+1. Extract user_id from JWT token
+2. URL decode query parameter
+3. Call sp_social_search_users(user_id, query, limit, offset)
+4. Return response
+
+**Success Response (200 OK):**
+```json
+{
+  "users": [
+    {
+      "user_id": "660e8400-e29b-41d4-a716-446655440000",
+      "username": "johndoe",
+      "first_name": "John",
+      "last_name": "Doe",
+      "main_photo_url": "https://cdn.example.com/photos/johndoe.jpg",
+      "is_verified": true,
+      "activities_created_count": 15,
+      "activities_attended_count": 45
+    }
+  ],
+  "total_count": 1,
+  "search_query": "john",
+  "limit": 20,
+  "offset": 0
+}
+```
+
+**Error Responses:**
+- 400 Bad Request: Invalid query (too short)
+- 401 Unauthorized: Invalid token
+
+---
+
+## ERROR HANDLING STANDARDS
+
+### Error Response Format
+All errors return consistent JSON structure:
+
+```json
+{
+  "error": {
+    "code": "ERROR_CODE",
+    "message": "Human-readable error message",
+    "details": {}
+  }
+}
+```
+
+### HTTP Status Codes
+- 200 OK: Success
+- 201 Created: Resource created successfully
+- 400 Bad Request: Validation error or business logic error
+- 401 Unauthorized: Invalid/missing JWT token
+- 403 Forbidden: Insufficient permissions (e.g., Premium required)
+- 404 Not Found: Resource not found
+- 429 Too Many Requests: Rate limit exceeded
+- 500 Internal Server Error: Unexpected server error
+
+### Error Code Mapping
+
+**Authentication Errors (401):**
+- `INVALID_TOKEN`: JWT token invalid or expired
+- `MISSING_TOKEN`: Authorization header missing
+
+**Permission Errors (403):**
+- `PREMIUM_REQUIRED`: Feature requires Premium/Club subscription
+
+**Validation Errors (400):**
+- `SELF_FRIEND_ERROR`: Cannot friend yourself
+- `SELF_BLOCK_ERROR`: Cannot block yourself
+- `SELF_FAVORITE_ERROR`: Cannot favorite yourself
+- `SELF_VIEW_ERROR`: Cannot record self-profile view
+- `INVALID_QUERY`: Search query too short
+- `INVALID_UUID`: Invalid UUID format
+
+**Business Logic Errors (400):**
+- `FRIENDSHIP_EXISTS`: Friendship already exists
+- `ALREADY_BLOCKED`: User already blocked
+- `ALREADY_FAVORITED`: User already favorited
+- `BLOCKED_BY_USER`: Action blocked due to user block
+- `USER_BLOCKED`: Cannot interact with blocked user
+
+**Not Found Errors (404):**
+- `USER_NOT_FOUND`: User does not exist
+- `FRIENDSHIP_NOT_FOUND`: Friendship not found
+- `BLOCK_NOT_FOUND`: Block not found
+- `FAVORITE_NOT_FOUND`: Favorite not found
+
+**Rate Limit Error (429):**
+```json
+{
+  "error": {
+    "code": "RATE_LIMIT_EXCEEDED",
+    "message": "Rate limit exceeded. Please try again later.",
+    "retry_after": 60
+  }
+}
+```
+
+---
+
+## POSTGRESQL STORED PROCEDURE IMPLEMENTATION GUIDELINES
+
+### Exception Handling
+All stored procedures must implement error handling:
+
+```sql
+BEGIN
+    -- Business logic here
+    
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE EXCEPTION '%', SQLERRM;
+END;
+```
+
+### Transaction Management
+- All write operations must be atomic (wrapped in implicit transaction)
+- Use ROLLBACK on errors
+- Use explicit SAVEPOINT for complex multi-step operations
+
+### Return JSON Format
+Always return JSON using `jsonb_build_object()` or `jsonb_agg()`:
+
+```sql
+RETURN jsonb_build_object(
+    'user_id', user_id,
+    'username', username,
+    'created_at', created_at
+);
+```
+
+For arrays:
+```sql
+RETURN jsonb_build_object(
+    'users', COALESCE(jsonb_agg(user_data), '[]'::jsonb),
+    'total_count', total_count
+);
+```
+
+### Performance Guidelines
+1. **Indexes**: All foreign keys and frequently queried columns must have indexes
+2. **Pagination**: Always use LIMIT/OFFSET for list queries
+3. **Joins**: Minimize JOIN depth (max 3 levels)
+4. **Subqueries**: Use CTEs (WITH clauses) for complex queries
+
+---
+
+## FASTAPI IMPLEMENTATION GUIDELINES
+
+### Project Structure
+```
+social-api/
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── config.py
+│   ├── dependencies.py
+│   ├── routes/
+│   │   ├── __init__.py
+│   │   ├── friendships.py
+│   │   ├── blocks.py
+│   │   ├── favorites.py
+│   │   ├── profile_views.py
+│   │   └── user_search.py
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── friendship_service.py
+│   │   ├── block_service.py
+│   │   ├── favorite_service.py
+│   │   ├── profile_view_service.py
+│   │   └── user_search_service.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── requests.py
+│   │   └── responses.py
+│   └── utils/
+│       ├── __init__.py
+│       ├── auth.py
+│       ├── database.py
+│       └── errors.py
+├── requirements.txt
+├── Dockerfile
+└── docker-compose.yml
+```
+
+### Dependencies (requirements.txt)
+```
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+psycopg[binary,pool]==3.1.16
+python-jose[cryptography]==3.3.0
+python-multipart==0.0.6
+redis==5.0.1
+slowapi==0.1.9
+```
+
+### Authentication Dependency
+```python
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt, JWTError
+
+security = HTTPBearer()
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> dict:
+    """Extract and validate JWT token, return user claims"""
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        return {
+            "user_id": payload["sub"],
+            "email": payload["email"],
+            "subscription_level": payload.get("subscription_level", "free"),
+            "ghost_mode": payload.get("ghost_mode", False)
+        }
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials"
+        )
+```
+
+### Database Connection Pool
+```python
+from psycopg_pool import ConnectionPool
+
+# Initialize connection pool
+pool = ConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=5,
+    max_size=20
+)
+
+async def get_db_connection():
+    """Get database connection from pool"""
+    with pool.connection() as conn:
+        yield conn
+```
+
+### Service Layer Pattern
+All database calls must go through service layer:
+
+```python
+# services/friendship_service.py
+class FriendshipService:
+    def __init__(self, db_conn):
+        self.db_conn = db_conn
+    
+    def send_friend_request(self, requester_id: str, target_id: str) -> dict:
+        """Call stored procedure and return result"""
+        with self.db_conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT activity.sp_social_send_friend_request(%s, %s)",
+                (requester_id, target_id)
+            )
+            result = cursor.fetchone()[0]
+            self.db_conn.commit()
+            return result
+```
+
+### Route Handler Pattern
+```python
+# routes/friendships.py
+from fastapi import APIRouter, Depends, HTTPException
+
+router = APIRouter(prefix="/social/friends", tags=["friendships"])
+
+@router.post("/request", status_code=201)
+async def send_friend_request(
+    request: SendFriendRequestRequest,
+    current_user: dict = Depends(get_current_user),
+    db = Depends(get_db_connection)
+):
+    """Send friend request"""
+    try:
+        service = FriendshipService(db)
+        result = service.send_friend_request(
+            requester_id=current_user["user_id"],
+            target_id=request.target_user_id
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+```
+
+### Pydantic Models
+```python
+# models/requests.py
+from pydantic import BaseModel, Field
+from uuid import UUID
+
+class SendFriendRequestRequest(BaseModel):
+    target_user_id: UUID = Field(..., description="User ID to send friend request to")
+
+# models/responses.py
+from pydantic import BaseModel
+from datetime import datetime
+from uuid import UUID
+
+class FriendshipResponse(BaseModel):
+    friendship_id: str
+    requester_user_id: UUID
+    target_user_id: UUID
+    status: str
+    initiated_by: UUID
+    created_at: datetime
+```
+
+### Rate Limiting
+```python
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address)
+
+@router.post("/request")
+@limiter.limit("20/minute")
+async def send_friend_request(...):
+    ...
+```
+
+---
+
+## TESTING GUIDELINES
+
+### Unit Tests (Stored Procedures)
+Each stored procedure must have tests for:
+1. Success case
+2. Each error case
+3. Edge cases (empty results, max pagination, etc.)
+
+### Integration Tests (API Endpoints)
+Each endpoint must have tests for:
+1. Success response (200/201)
+2. Authentication errors (401)
+3. Validation errors (400)
+4. Permission errors (403)
+5. Rate limiting (429)
+
+### Example Test Structure
+```python
+# tests/test_friendships.py
+import pytest
+from fastapi.testclient import TestClient
+
+def test_send_friend_request_success(client: TestClient, auth_token: str):
+    response = client.post(
+        "/social/friends/request",
+        json={"target_user_id": "660e8400-e29b-41d4-a716-446655440000"},
+        headers={"Authorization": f"Bearer {auth_token}"}
+    )
+    assert response.status_code == 201
+    assert "friendship_id" in response.json()
+
+def test_send_friend_request_self_error(client: TestClient, auth_token: str):
+    response = client.post(
+        "/social/friends/request",
+        json={"target_user_id": "550e8400-e29b-41d4-a716-446655440000"},
+        headers={"Authorization": f"Bearer {auth_token}"}
+    )
+    assert response.status_code == 400
+    assert "SELF_FRIEND_ERROR" in response.json()["error"]["code"]
+```
+
+---
+
+## API ENDPOINT SUMMARY
+
+### Friendships
+- POST /social/friends/request - Send friend request
+- POST /social/friends/accept - Accept friend request
+- POST /social/friends/decline - Decline friend request
+- DELETE /social/friends/{friend_user_id} - Remove friend
+- GET /social/friends - Get friends list
+- GET /social/friends/requests/received - Get pending requests (received)
+- GET /social/friends/requests/sent - Get sent requests
+- GET /social/friends/status/{target_user_id} - Check friendship status
+
+### Blocking
+- POST /social/blocks - Block user
+- DELETE /social/blocks/{blocked_user_id} - Unblock user
+- GET /social/blocks - Get blocked users list
+- GET /social/blocks/status/{target_user_id} - Check block status
+- GET /social/blocks/can-interact/{target_user_id} - Check can interact (with activity type)
+
+### Favorites
+- POST /social/favorites - Favorite user
+- DELETE /social/favorites/{favorited_user_id} - Unfavorite user
+- GET /social/favorites/mine - Get my favorites
+- GET /social/favorites/who-favorited-me - Get who favorited me (Premium)
+- GET /social/favorites/status/{target_user_id} - Check favorite status
+
+### Profile Views
+- POST /social/profile-views - Record profile view
+- GET /social/profile-views/who-viewed-me - Get who viewed me (Premium)
+- GET /social/profile-views/my-count - Get my view count
+
+### User Search
+- GET /social/users/search - Search users by name/username
+
+---
+
+## DEPLOYMENT CONFIGURATION
+
+### Environment Variables
+```bash
+# Database
+DATABASE_URL=postgresql://user:pass@host:5432/dbname
+DATABASE_POOL_MIN_SIZE=5
+DATABASE_POOL_MAX_SIZE=20
+
+# JWT
+JWT_SECRET_KEY=your-secret-key-here
+JWT_ALGORITHM=HS256
+
+# Redis (Rate Limiting)
+REDIS_URL=redis://localhost:6379/0
+
+# API
+API_HOST=0.0.0.0
+API_PORT=8000
+API_WORKERS=4
+API_RELOAD=false
+
+# CORS
+CORS_ORIGINS=["http://localhost:3000"]
+```
+
+### Docker Compose
+```yaml
+version: '3.8'
+
+services:
+  social-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - REDIS_URL=${REDIS_URL}
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=activitydb
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
+```
+
+---
+
+## MONITORING & LOGGING
+
+### Health Check Endpoint
+```python
+@router.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "service": "social-api",
+        "version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+```
+
+### Logging Configuration
+```python
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+logger = logging.getLogger("social-api")
+```
+
+### Metrics to Track
+1. Request count per endpoint
+2. Response times (p50, p95, p99)
+3. Error rate by status code
+4. Database connection pool usage
+5. Rate limit hits
+6. Active users count
+
+---
+
+## SECURITY CONSIDERATIONS
+
+### SQL Injection Prevention
+- ALWAYS use parameterized queries
+- NEVER concatenate user input into SQL strings
+- Use psycopg3's parameter binding: `cursor.execute(query, (param1, param2))`
+
+### JWT Token Validation
+- Validate token signature
+- Check expiration
+- Verify required claims (sub, email, subscription_level)
+- Handle token refresh separately (not in Social API)
+
+### Rate Limiting Strategy
+- Per-user rate limits (based on user_id from token)
+- Use Redis for distributed rate limiting
+- Return 429 with Retry-After header
+
+### Input Validation
+- Use Pydantic models for all request bodies
+- Validate UUIDs format
+- Sanitize search queries (prevent SQL injection)
+- Enforce max length on text fields
+
+### CORS Configuration
+```python
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"]
+)
+```
+
+---
+
+## AI CODE GENERATION CHECKLIST
+
+When generating code from these specifications:
+
+### Database Layer
+- [ ] Create all stored procedures with exact signatures
+- [ ] Implement exception handling in each SP
+- [ ] Use jsonb_build_object() for JSON returns
+- [ ] Add indexes for all foreign keys
+- [ ] Include pagination in list queries
+
+### Service Layer
+- [ ] One service class per module (FriendshipService, BlockService, etc.)
+- [ ] Each service method calls one stored procedure
+- [ ] Handle database exceptions
+- [ ] Commit transactions on success
+- [ ] Rollback on errors
+
+### API Layer
+- [ ] Create router for each module
+- [ ] Implement authentication dependency
+- [ ] Add rate limiting decorators
+- [ ] Define Pydantic request/response models
+- [ ] Map stored procedure errors to HTTP status codes
+- [ ] Return consistent error JSON format
+
+### Testing
+- [ ] Unit tests for each stored procedure
+- [ ] Integration tests for each endpoint
+- [ ] Test success cases
+- [ ] Test all error cases
+- [ ] Test rate limiting
+- [ ] Test authentication
+
+### Documentation
+- [ ] OpenAPI schema auto-generated by FastAPI
+- [ ] Add description to each endpoint
+- [ ] Add examples to Pydantic models
+- [ ] Include error response examples
+
+---
+
+## CONCLUSION
+
+This specification provides complete, unambiguous instructions for building the Social API. All endpoints map directly to stored procedures with well-defined contracts. Error handling, authentication, and rate limiting are standardized across all modules.
+
+**CRITICAL FOR AI AGENTS:**
+1. All database access MUST go through stored procedures
+2. All endpoints MUST require JWT authentication
+3. All list endpoints MUST support pagination
+4. All errors MUST return consistent JSON format
+5. Premium features MUST check subscription_level from JWT
+6. Ghost Mode MUST be respected for profile views
+7. Blocking MUST NOT apply to XXL activities
+8. All friend/block/favorite operations MUST check for existing blocks
+
+Generate code following these specifications exactly. Do not add features not specified. Do not skip error handling. Do not bypass stored procedures.
