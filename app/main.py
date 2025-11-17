@@ -13,10 +13,55 @@ logger = get_logger(__name__)
 # Create FastAPI app
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
+    version=settings.API_VERSION,
+    description="""Social interaction service managing likes, follows, comments, and blocking.
+
+Features premium tier restrictions, activity size limits, and comprehensive social graph management.
+
+## Key Features
+- Likes and reactions
+- Follow/unfollow with follower counts
+- Comment threads
+- User blocking (with XXL activity exception)
+- Premium tier features (unlimited follows)
+- Stored procedure architecture
+
+## Architecture
+- Database: PostgreSQL with `activity` schema
+- Auth: JWT Bearer tokens
+- Rate limiting: Redis-backed limits""",
+    docs_url="/docs" if settings.ENABLE_DOCS else None,
+    redoc_url="/redoc" if settings.ENABLE_DOCS else None,
+    openapi_url="/openapi.json" if settings.ENABLE_DOCS else None,
+    contact={"name": "Activity Platform Team", "email": "dev@activityapp.com"},
+    license_info={"name": "Proprietary"}
 )
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi
+    openapi_schema = get_openapi(
+        title=settings.PROJECT_NAME,
+        version=settings.API_VERSION,
+        description=app.description,
+        routes=app.routes,
+    )
+    openapi_schema["components"]["securitySchemes"] = {
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+            "description": "Enter JWT token from auth-api"
+        }
+    }
+    openapi_schema["security"] = [{"BearerAuth": []}]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
 
 # CORS Middleware
 app.add_middleware(
